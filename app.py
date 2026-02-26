@@ -1,55 +1,25 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse
-import os, shutil
+import os
+import re
+import shutil
 from datetime import datetime
+from typing import List, Dict, Any
 
-APP_DATA_DIR = os.getenv("APP_DATA_DIR", "/tmp/uploads")
-os.makedirs(APP_DATA_DIR, exist_ok=True)
-
-app = FastAPI(title="Panquel Predict - Upload")
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <h2>Panquel Predict - Subir Dataset</h2>
-    <form action="/upload" enctype="multipart/form-data" method="post">
-      <input name="file" type="file" />
-      <button type="submit">Subir</button>
-    </form>
-    <p>Ver archivos: <a href="/files">/files</a></p>
-    """
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith((".csv", ".xlsx")):
-        raise HTTPException(status_code=400, detail="Solo se permiten .csv o .xlsx")
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe = file.filename.replace(" ", "_")
-    path = os.path.join(APP_DATA_DIR, f"{ts}_{safe}")
-
-    with open(path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    return {"ok": True, "saved_as": os.path.basename(path)}
-
-@app.get("/files")
-def list_files():
-    return {"path": APP_DATA_DIR, "files": sorted(os.listdir(APP_DATA_DIR))}
-
-from typing import Optional
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from fastapi import Query
-import re
 
-# ==========
-# Config IA
-# ==========
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.responses import HTMLResponse
+
+# =========================
+# CONFIG GENERAL
+# =========================
+APP_DATA_DIR = os.getenv("APP_DATA_DIR", "/tmp/uploads")
+os.makedirs(APP_DATA_DIR, exist_ok=True)
+
 LAGS = 6
-DEFAULT_EPOCHS = int(os.getenv("EPOCHS", "100"))  # puedes subirlo luego
+DEFAULT_EPOCHS = int(os.getenv("EPOCHS", "100"))  # default bajo para Render
 LR = float(os.getenv("LR", "0.01"))
 TEST_SIZE = float(os.getenv("TEST_SIZE", "0.2"))
 SEED = int(os.getenv("SEED", "42"))
@@ -57,21 +27,39 @@ SEED = int(os.getenv("SEED", "42"))
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
+# Columnas esperadas en dataset "mejorado"
 META_COLS = ["ID", "Producto", "Unidad", "Provedores"]
-PRODUCT_COL = "Producto"
-GROUP_COL = "Provedores"
+
+# Fallbacks comunes
+FALLBACK_PRODUCT_COLS = ["Producto", "Unnamed: 0", "PRODUCTO", "product"]
+FALLBACK_PROVIDER_COLS = ["Provedores", "Proveedores", "Proveedor", "PROVEEDOR", "provider"]
+
+app = FastAPI(title="Panquel Predict API")
 
 
+# =========================
+# UTILIDADES DE ARCHIVOS
+# =========================
 def latest_uploaded_file() -> str:
-    """Regresa el path del archivo más reciente en APP_DATA_DIR."""
     files = [f for f in os.listdir(APP_DATA_DIR) if f.lower().endswith(".csv")]
     if not files:
-        raise HTTPException(status_code=404, detail="No hay CSV subido aún. Sube uno en /upload.")
-    files.sort()  # como guardamos con timestamp YYYYMMDD_HHMMSS, sort sirve
+        raise HTTPException(status_code=404, detail="No hay CSV subido. Usa /upload.")
+    files.sort()  # timestamp al inicio => orden correcto
     return os.path.join(APP_DATA_DIR, files[-1])
 
 
-def _split_groups(cell: str):
+# =========================
+# UTILIDADES DE DATASET
+# =========================
+def pick_first_existing(df: pd.DataFrame, candidates: List[str]) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise HTTPException(status_code=400, detail=f"No encontré ninguna columna válida entre: {candidates}")
+
+
+def split_groups(cell: Any) -> List[str]:
+    """Separa 'CON, SOR / ALA|X' -> ['CON','SOR','ALA','X']"""
     if cell is None or (isinstance(cell, float) and np.isnan(cell)):
         return []
     s = str(cell).strip()
@@ -81,22 +69,41 @@ def _split_groups(cell: str):
     return [p.strip() for p in parts if p.strip()]
 
 
-def get_groups(df: pd.DataFrame):
+def get_week_cols(df: pd.DataFrame) -> List[str]:
+    """Columnas numéricas de semanas: todo lo que NO sea meta conocida."""
+    # Si el dataset trae meta cols distintas, igual funcionará porque filtramos con fallback.
+    known = set(META_COLS)
+    # También excluimos columnas de proveedor/producto si tienen otro nombre
+    for c in FALLBACK_PRODUCT_COLS + FALLBACK_PROVIDER_COLS:
+        known.add(c)
+    week_cols = [c for c in df.columns if c not in known]
+    # Filtra columnas que realmente tengan valores numéricos
+    if not week_cols:
+        # Último recurso: tomar todas menos la 1ra si parece ser nombre
+        if len(df.columns) > 1:
+            week_cols = df.columns[1:].tolist()
+    return week_cols
+
+
+def list_groups(df: pd.DataFrame, provider_col: str) -> List[str]:
     groups = set()
-    for v in df[GROUP_COL].values:
-        for g in _split_groups(v):
+    for v in df[provider_col].values:
+        for g in split_groups(v):
             groups.add(g)
     return sorted(groups)
 
 
+# =========================
+# VENTANAS + MODELO
+# =========================
 def make_windows_narx(data_matrix: np.ndarray, exo_series: np.ndarray, lags: int = 6):
     X_list, y_list = [], []
     n_products, n_weeks = data_matrix.shape
     for p in range(n_products):
         y_series = data_matrix[p]
         for t in range(lags, n_weeks):
-            y_lags = y_series[t-lags:t]
-            x_lags = exo_series[t-lags:t]
+            y_lags = y_series[t - lags : t]
+            x_lags = exo_series[t - lags : t]
             X_list.append(np.concatenate([y_lags, x_lags]))
             y_list.append(y_series[t])
     return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32)
@@ -117,49 +124,53 @@ class NeuralNARX(nn.Module):
         return self.net(x)
 
 
-def train_and_predict(df: pd.DataFrame, group: str = "ALL", epochs: int = DEFAULT_EPOCHS):
-    # 1) columnas de semanas
-    week_cols = [c for c in df.columns if c not in META_COLS]
-    if not week_cols:
-        raise HTTPException(status_code=400, detail="No detecté columnas de semanas en el CSV.")
+def train_and_predict(
+    df: pd.DataFrame,
+    group: str,
+    epochs: int,
+) -> pd.DataFrame:
+    # Detectar columnas
+    product_col = pick_first_existing(df, FALLBACK_PRODUCT_COLS)
+    provider_col = pick_first_existing(df, FALLBACK_PROVIDER_COLS)
+    week_cols = get_week_cols(df)
 
-    # 2) matriz numérica
+    # Matriz numérica
     weeks_df = df[week_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     data_all = weeks_df.values.astype(np.float32)
 
-    # 3) filtrar por grupo (si aplica)
+    # Filtrar por grupo si aplica
     if group.upper() == "ALL":
         df_group = df.copy()
         data_group = data_all
     else:
-        mask = df[GROUP_COL].apply(lambda x: group in _split_groups(x))
+        mask = df[provider_col].apply(lambda x: group in split_groups(x))
         df_group = df.loc[mask].copy()
         data_group = data_all[mask.values]
         if df_group.empty:
             raise HTTPException(status_code=404, detail=f"No hay productos para el grupo: {group}")
 
-    # 4) exógena global (recomendado)
+    # Exógena global (recomendado)
     exo_total = data_all.sum(axis=0).astype(np.float32)
 
-    # 5) ventanas NARX
+    # Ventanas
     X, y = make_windows_narx(data_group, exo_total, lags=LAGS)
+    if len(X) < 10:
+        raise HTTPException(status_code=400, detail="Dataset insuficiente para entrenar con LAGS=6.")
 
-    # split temporal
+    # Split temporal
     split_idx = int(len(X) * (1 - TEST_SIZE))
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
     X_train_t = torch.tensor(X_train)
     y_train_t = torch.tensor(y_train).unsqueeze(1)
-    X_test_t = torch.tensor(X_test)
-    y_test_t = torch.tensor(y_test).unsqueeze(1)
 
-    # 6) modelo
+    # Modelo
     model = NeuralNARX(input_size=2 * LAGS)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = nn.MSELoss()
 
-    # 7) entrenamiento rápido
+    # Entrenamiento
     model.train()
     for _ in range(epochs):
         optimizer.zero_grad()
@@ -168,7 +179,7 @@ def train_and_predict(df: pd.DataFrame, group: str = "ALL", epochs: int = DEFAUL
         loss.backward()
         optimizer.step()
 
-    # 8) predicción siguiente semana para productos filtrados
+    # Predicción próxima semana por producto
     model.eval()
     last_x = exo_total[-LAGS:]
     preds = []
@@ -182,56 +193,104 @@ def train_and_predict(df: pd.DataFrame, group: str = "ALL", epochs: int = DEFAUL
     preds = np.array(preds)
     preds_round = np.clip(np.rint(preds), 0, None).astype(int)
 
-    results = pd.DataFrame({
-        "Producto": df_group[PRODUCT_COL].astype(str).values,
-        "Provedores": df_group[GROUP_COL].astype(str).values,
-        "Pred_Sig_Semana": preds_round
-    }).sort_values("Pred_Sig_Semana", ascending=False).reset_index(drop=True)
+    # Armar resultados
+    out = pd.DataFrame(
+        {
+            "Producto": df_group[product_col].astype(str).values,
+            "Provedores": df_group[provider_col].astype(str).values,
+            "Pred_Sig_Semana": preds_round,
+        }
+    ).sort_values("Pred_Sig_Semana", ascending=False).reset_index(drop=True)
 
-    total = int(results["Pred_Sig_Semana"].sum())
+    return out
 
-    # métricas rápidas (opcional)
-    with torch.no_grad():
-        y_pred_test = model(X_test_t).squeeze().cpu().numpy() if len(X_test) else np.array([])
-        y_true_test = y_test_t.squeeze().cpu().numpy() if len(X_test) else np.array([])
 
-    return results, total, {
-        "epochs": epochs,
-        "n_products_group": int(data_group.shape[0]),
-        "n_weeks": int(data_all.shape[1]),
-        "samples": int(len(X)),
-        "test_samples": int(len(X_test)),
-    }
+# =========================
+# ENDPOINTS
+# =========================
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <h2>Panquel Predict - Upload</h2>
+    <form action="/upload" enctype="multipart/form-data" method="post">
+      <input name="file" type="file" />
+      <button type="submit">Subir</button>
+    </form>
+    <p>Archivos: <a href="/files">/files</a></p>
+    <p>Grupos: <a href="/groups">/groups</a></p>
+    <p>Docs: <a href="/docs">/docs</a></p>
+    """
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Solo se permite .csv")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = file.filename.replace(" ", "_")
+    save_path = os.path.join(APP_DATA_DIR, f"{ts}_{safe}")
+
+    with open(save_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return {"ok": True, "saved_as": os.path.basename(save_path), "path": APP_DATA_DIR}
+
+
+@app.get("/files")
+def list_files():
+    files = sorted([f for f in os.listdir(APP_DATA_DIR) if f.lower().endswith(".csv")])
+    return {"path": APP_DATA_DIR, "files": files, "latest": os.path.basename(latest_uploaded_file()) if files else None}
 
 
 @app.get("/groups")
 def api_groups():
-    """
-    Lista los grupos disponibles según la columna Provedores.
-    """
     path = latest_uploaded_file()
     df = pd.read_csv(path)
-    return {"latest_file": os.path.basename(path), "groups": get_groups(df)}
+
+    provider_col = pick_first_existing(df, FALLBACK_PROVIDER_COLS)
+    groups = list_groups(df, provider_col)
+
+    return {"latest_file": os.path.basename(path), "provider_col": provider_col, "groups": groups}
 
 
 @app.get("/predict")
 def api_predict(
-    group: str = Query("ALL", description='Grupo a predecir. Usa "ALL" para todos. Ej: CON'),
-    epochs: int = Query(DEFAULT_EPOCHS, ge=10, le=600, description="Épocas de entrenamiento (más = más lento)"),
-    top: int = Query(20, ge=1, le=200, description="Cuántos resultados regresar")
+    group: str = Query("ALL", description='Grupo a predecir. "ALL" para todos. Ej: SOR'),
+    epochs: int = Query(DEFAULT_EPOCHS, ge=5, le=600, description="Épocas (más = más lento)"),
+    top: int = Query(20, ge=0, le=50000, description="0 = todos; si no, Top N"),
+    group_by_provider: bool = Query(False, description="Si true y group=ALL, agrupa por Provedores"),
 ):
-    """
-    Entrena un NARX rápido con el último CSV subido y regresa predicción de la siguiente semana.
-    """
     path = latest_uploaded_file()
     df = pd.read_csv(path)
 
-    results, total, info = train_and_predict(df, group=group, epochs=epochs)
+    results = train_and_predict(df, group=group, epochs=epochs)
+    total = int(results["Pred_Sig_Semana"].sum())
+
+    # Top / todos
+    out_df = results if top == 0 else results.head(top)
+
+    # Agrupado por proveedor (solo cuando group=ALL)
+    if group.upper() == "ALL" and group_by_provider:
+        sorted_df = results.sort_values(["Provedores", "Pred_Sig_Semana"], ascending=[True, False])
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for prov, sub in sorted_df.groupby("Provedores", sort=True):
+            grouped[str(prov)] = sub.to_dict(orient="records")
+
+        return {
+            "latest_file": os.path.basename(path),
+            "group": group,
+            "epochs": epochs,
+            "lags": LAGS,
+            "grouped_by_provider": grouped,
+            "total_pred_next_week": total,
+        }
 
     return {
         "latest_file": os.path.basename(path),
         "group": group,
-        "info": info,
-        "top": results.head(top).to_dict(orient="records"),
-        "total_pred_next_week": total
+        "epochs": epochs,
+        "lags": LAGS,
+        "results": out_df.to_dict(orient="records"),
+        "total_pred_next_week": total,
     }
