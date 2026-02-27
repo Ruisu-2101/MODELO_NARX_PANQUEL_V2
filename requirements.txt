@@ -4,3 +4,5 @@ python-multipart
 pandas
 numpy
 torch
+sqlalchemy
+psycopg2-binary

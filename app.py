@@ -12,6 +12,25 @@ from torch import nn
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = None  # permite correr sin BD si no está seteada
+
+engine = None
+SessionLocal = None
+
+if DATABASE_URL:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=3,
+        max_overflow=2
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 # =========================
 # CONFIG GENERAL
 # =========================
