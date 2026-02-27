@@ -313,3 +313,14 @@ def api_predict(
         "results": out_df.to_dict(orient="records"),
         "total_pred_next_week": total,
     }
+
+@app.get("/db-test")
+def db_test():
+    db = SessionLocal()
+    try:
+        row = db.execute(text("select now() as now;")).mappings().first()
+        return {"ok": True, "now": str(row["now"])}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
