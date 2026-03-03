@@ -7,6 +7,7 @@ from typing import List, Dict, Any
 import numpy as np
 import pandas as pd
 import torch
+import traceback
 from torch import nn
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
@@ -15,6 +16,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
+from fastapi import HTTPException
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -32,27 +34,32 @@ if DATABASE_URL:
     )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def load_dataset_from_db():
-    """
-    Lee la tabla 'pedido' desde Supabase y la convierte
-    al mismo formato que el CSV original.
-    """
+def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
     db = SessionLocal()
     try:
-        result = db.execute(text("SELECT * FROM pedido"))
+        result = db.execute(text(f'SELECT * FROM "{table_name}"'))
         rows = result.fetchall()
-        cols = result.keys()
-
+        cols = list(result.keys())
         df = pd.DataFrame(rows, columns=cols)
 
-        # Ordenar columnas: primero producto, proveedor, luego semanas
-        base_cols = ["producto_nombre", "provedor_id"]
-        week_cols = [c for c in df.columns if c not in base_cols and c != "id"]
+        # Detectar columnas meta (producto / proveedor)
+        col_producto = next((c for c in df.columns if c.lower() in ["producto_nombre", "producto", "nombre_producto"]), None)
+        col_prov = next((c for c in df.columns if c.lower() in ["provedor_id", "proveedor_id", "proveedor", "provedor"]), None)
 
-        df = df[base_cols + week_cols]
+        if not col_producto or not col_prov:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No encontré columnas de producto/proveedor. Columnas detectadas: {df.columns.tolist()}"
+            )
+
+        week_cols = [c for c in df.columns if c not in [col_producto, col_prov, "id"]]
+
+        df[week_cols] = df[week_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+        df = df[[col_producto, col_prov] + week_cols].copy()
+        df = df.rename(columns={col_producto: "Producto", col_prov: "Provedores"})
 
         return df
-
     finally:
         db.close()
 
@@ -350,35 +357,33 @@ def db_test():
     finally:
         db.close()
 
+@app.get("/db-pedido-info")
+def db_pedido_info(limit: int = 3):
+    db = SessionLocal()
+    try:
+        result = db.execute(text("SELECT * FROM pedido LIMIT :n"), {"n": limit})
+        rows = result.fetchall()
+        cols = list(result.keys())
+
+        preview = []
+        for r in rows:
+            preview.append({cols[i]: (str(r[i]) if r[i] is not None else None) for i in range(len(cols))})
+
+        return {"ok": True, "columns": cols, "preview": preview}
+    except Exception:
+        return {"ok": False, "error": traceback.format_exc()}
+    finally:
+        db.close()
+
 @app.get("/predict-db")
-def predict_db(
-    group: str = "ALL",
-    epochs: int = DEFAULT_EPOCHS,
-    top: int = 20,
-    group_by_provider: bool = False,
-):
-    """
-    Hace predicción usando directamente la tabla 'pedido' en Supabase
-    """
-    df = load_dataset_from_db()
-
-    # Extraer nombres
-    products = df["producto_nombre"].astype(str).values
-    providers = df["provedor_id"].astype(str).values
-
-    # Solo columnas numéricas (semanas)
-    numeric_df = df.drop(columns=["producto_nombre", "provedor_id"])
-    data = numeric_df.values.astype("float32")
-
-    # Aquí reutiliza tu lógica NARX
-    # (usa tu función make_windows_narx y modelo actual)
-
-    # --- Aquí va tu código de entrenamiento ---
-    # (te lo dejo resumido para no duplicar 200 líneas)
-
-    # Simulación rápida de retorno por ahora:
-    return {
-        "ok": True,
-        "rows": len(df),
-        "group": group
-    }
+def predict_db_smoke():
+    try:
+        df = load_dataset_from_db("pedido")
+        return {
+            "ok": True,
+            "rows": int(len(df)),
+            "cols": df.columns.tolist(),
+            "head": df.head(2).to_dict(orient="records")
+        }
+    except Exception:
+        return {"ok": False, "error": traceback.format_exc()}
