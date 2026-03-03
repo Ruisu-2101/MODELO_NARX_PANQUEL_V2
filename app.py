@@ -42,20 +42,26 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
         cols = list(result.keys())
         df = pd.DataFrame(rows, columns=cols)
 
-        # Detectar columnas meta (producto / proveedor)
-        col_producto = next((c for c in df.columns if c.lower() in ["producto_nombre", "producto", "nombre_producto"]), None)
-        col_prov = next((c for c in df.columns if c.lower() in ["provedor_id", "proveedor_id", "proveedor", "provedor"]), None)
+        # Detectar columnas meta
+        col_producto = "producto_nombre" if "producto_nombre" in df.columns else None
+        col_prov = "provedor_id" if "provedor_id" in df.columns else None
 
         if not col_producto or not col_prov:
             raise HTTPException(
                 status_code=400,
-                detail=f"No encontré columnas de producto/proveedor. Columnas detectadas: {df.columns.tolist()}"
+                detail=f"No encontré columnas producto/proveedor. Columnas: {df.columns.tolist()}"
             )
 
-        week_cols = [c for c in df.columns if c not in [col_producto, col_prov, "id"]]
+        # Columnas a excluir (no son semanas)
+        exclude = {"id", "cantidad", col_producto, col_prov}
 
+        # Semanas = todo lo demás
+        week_cols = [c for c in df.columns if c not in exclude]
+
+        # Convertir semanas a numérico
         df[week_cols] = df[week_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
+        # Orden final y nombres estándar (para reutilizar tu pipeline)
         df = df[[col_producto, col_prov] + week_cols].copy()
         df = df.rename(columns={col_producto: "Producto", col_prov: "Provedores"})
 
@@ -376,14 +382,39 @@ def db_pedido_info(limit: int = 3):
         db.close()
 
 @app.get("/predict-db")
-def predict_db_smoke():
-    try:
-        df = load_dataset_from_db("pedido")
+def api_predict_db(
+    group: str = Query("ALL", description='Grupo a predecir. "ALL" para todos. Ej: SOR'),
+    epochs: int = Query(DEFAULT_EPOCHS, ge=5, le=600, description="Épocas (más = más lento)"),
+    top: int = Query(20, ge=0, le=50000, description="0 = todos; si no, Top N"),
+    group_by_provider: bool = Query(False, description="Si true y group=ALL, agrupa por Provedores"),
+):
+    # 1) Cargar tabla pedido -> DataFrame tipo CSV
+    df = load_dataset_from_db("pedido")
+
+    # 2) Reusar tu pipeline actual (NARX)
+    results = train_and_predict(df, group=group, epochs=epochs)
+    total = int(results["Pred_Sig_Semana"].sum())
+
+    out_df = results if top == 0 else results.head(top)
+
+    # 3) Si se pide agrupado por proveedor (solo en ALL)
+    if group.upper() == "ALL" and group_by_provider:
+        sorted_df = results.sort_values(["Provedores", "Pred_Sig_Semana"], ascending=[True, False])
+        grouped = {str(k): v.to_dict(orient="records") for k, v in sorted_df.groupby("Provedores", sort=True)}
         return {
-            "ok": True,
-            "rows": int(len(df)),
-            "cols": df.columns.tolist(),
-            "head": df.head(2).to_dict(orient="records")
+            "source": "supabase_table:pedido",
+            "group": group,
+            "epochs": epochs,
+            "lags": LAGS,
+            "grouped_by_provider": grouped,
+            "total_pred_next_week": total,
         }
-    except Exception:
-        return {"ok": False, "error": traceback.format_exc()}
+
+    return {
+        "source": "supabase_table:pedido",
+        "group": group,
+        "epochs": epochs,
+        "lags": LAGS,
+        "results": out_df.to_dict(orient="records"),
+        "total_pred_next_week": total,
+    }
