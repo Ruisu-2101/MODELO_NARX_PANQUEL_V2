@@ -418,3 +418,17 @@ def api_predict_db(
         "results": out_df.to_dict(orient="records"),
         "total_pred_next_week": total,
     }
+
+@app.get("/db/providers")
+def db_providers():
+    db = SessionLocal()
+    try:
+        rows = db.execute(text("""
+            select distinct provedor_id
+            from pedido
+            where provedor_id is not null and provedor_id <> ''
+            order by provedor_id;
+        """)).fetchall()
+        return {"providers": [r[0] for r in rows]}
+    finally:
+        db.close()
