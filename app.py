@@ -424,10 +424,10 @@ def db_providers():
     db = SessionLocal()
     try:
         rows = db.execute(text("""
-            select distinct provedor_id
+            select distinct proveedor_id
             from pedido
-            where provedor_id is not null and provedor_id <> ''
-            order by provedor_id;
+            where proveedor_id is not null and proveedor_id <> ''
+            order by proveedor_id;
         """)).fetchall()
         return {"providers": [r[0] for r in rows]}
     finally:
