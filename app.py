@@ -44,7 +44,7 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
 
         # Detectar columnas meta
         col_producto = "producto_nombre" if "producto_nombre" in df.columns else None
-        col_prov = "provedor_id" if "provedor_id" in df.columns else None
+        col_prov = "proveedor_id" if "proveedor_id" in df.columns else None
 
         if not col_producto or not col_prov:
             raise HTTPException(
