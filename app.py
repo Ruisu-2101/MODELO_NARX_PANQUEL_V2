@@ -50,6 +50,7 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
         # Detectar columnas meta
         col_producto = "producto_nombre" if "producto_nombre" in df.columns else None
         col_prov = "proveedor_id" if "proveedor_id" in df.columns else None
+	col_name = "name" if "name" in df.columns else None
 
         if not col_producto or not col_prov:
             raise HTTPException(
@@ -58,7 +59,7 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
             )
 
         # Columnas a excluir (no son semanas)
-        exclude = {"id", "cantidad", col_producto, col_prov}
+        exclude = {"id", "cantidad", col_producto, col_prov, col_name}
 
         # Semanas = todo lo demás
         week_cols = [c for c in df.columns if c not in exclude]
@@ -67,8 +68,19 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
         df[week_cols] = df[week_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
         # Orden final y nombres estándar (para reutilizar tu pipeline)
-        df = df[[col_producto, col_prov] + week_cols].copy()
-        df = df.rename(columns={col_producto: "Producto", col_prov: "Provedores"})
+        cols = [col_producto, col_prov] + ([col_name] if col_name else []) + week_cols
+	df = df[cols].copy()
+
+	rename_map = {
+    		col_producto: "Producto",
+    		col_prov: "Provedores"
+	}
+
+	if col_name:
+    		rename_map[col_name] = "Name"
+
+	df = df.rename(columns=rename_map)
+
 
         return df
     finally:
@@ -256,14 +268,16 @@ def train_and_predict(
     preds_round = np.clip(np.rint(preds), 0, None).astype(int)
 
     # Armar resultados
-    out = pd.DataFrame(
-        {
-            "Producto": df_group[product_col].astype(str).values,
-            "Provedores": df_group[provider_col].astype(str).values,
-            "Pred_Sig_Semana": preds_round,
-        }
-    ).sort_values("Pred_Sig_Semana", ascending=False).reset_index(drop=True)
+    out_data = {
+    	"Producto": df_group[product_col].astype(str).values,
+    	"Provedores": df_group[provider_col].astype(str).values,
+    	"Pred_Sig_Semana": preds_round,
+	}
 
+	if "Name" in df_group.columns:
+    	out_data["Name"] = df_group["Name"].astype(str).values
+
+	out = pd.DataFrame(out_data)
     return out
 
 
