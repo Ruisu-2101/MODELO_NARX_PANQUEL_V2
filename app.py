@@ -15,8 +15,6 @@ from fastapi.responses import HTMLResponse
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import text
-from fastapi import HTTPException
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -34,10 +32,12 @@ if DATABASE_URL:
     )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+
 def get_db():
     if SessionLocal is None:
         raise HTTPException(status_code=500, detail="DATABASE_URL no configurada.")
     return SessionLocal()
+
 
 def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
     db = get_db()
@@ -50,7 +50,7 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
         # Detectar columnas meta
         col_producto = "producto_nombre" if "producto_nombre" in df.columns else None
         col_prov = "proveedor_id" if "proveedor_id" in df.columns else None
-	col_name = "name" if "name" in df.columns else None
+        col_name = "name" if "name" in df.columns else None
 
         if not col_producto or not col_prov:
             raise HTTPException(
@@ -69,22 +69,22 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
 
         # Orden final y nombres estándar (para reutilizar tu pipeline)
         cols = [col_producto, col_prov] + ([col_name] if col_name else []) + week_cols
-	df = df[cols].copy()
+        df = df[cols].copy()
 
-	rename_map = {
-    		col_producto: "Producto",
-    		col_prov: "Provedores"
-	}
+        rename_map = {
+            col_producto: "Producto",
+            col_prov: "Provedores"
+        }
 
-	if col_name:
-    		rename_map[col_name] = "Name"
+        if col_name:
+            rename_map[col_name] = "Name"
 
-	df = df.rename(columns=rename_map)
-
+        df = df.rename(columns=rename_map)
 
         return df
     finally:
         db.close()
+
 
 # =========================
 # CONFIG GENERAL
@@ -102,7 +102,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 # Columnas esperadas en dataset "mejorado"
-META_COLS = ["ID", "Producto", "Unidad", "Provedores"]
+META_COLS = ["ID", "Producto", "Unidad", "Provedores", "Name"]
 
 # Fallbacks comunes
 FALLBACK_PRODUCT_COLS = ["Producto", "Unnamed: 0", "PRODUCTO", "product"]
@@ -145,15 +145,12 @@ def split_groups(cell: Any) -> List[str]:
 
 def get_week_cols(df: pd.DataFrame) -> List[str]:
     """Columnas numéricas de semanas: todo lo que NO sea meta conocida."""
-    # Si el dataset trae meta cols distintas, igual funcionará porque filtramos con fallback.
     known = set(META_COLS)
-    # También excluimos columnas de proveedor/producto si tienen otro nombre
     for c in FALLBACK_PRODUCT_COLS + FALLBACK_PROVIDER_COLS:
         known.add(c)
     week_cols = [c for c in df.columns if c not in known]
-    # Filtra columnas que realmente tengan valores numéricos
+
     if not week_cols:
-        # Último recurso: tomar todas menos la 1ra si parece ser nombre
         if len(df.columns) > 1:
             week_cols = df.columns[1:].tolist()
     return week_cols
@@ -176,8 +173,8 @@ def make_windows_narx(data_matrix: np.ndarray, exo_series: np.ndarray, lags: int
     for p in range(n_products):
         y_series = data_matrix[p]
         for t in range(lags, n_weeks):
-            y_lags = y_series[t - lags : t]
-            x_lags = exo_series[t - lags : t]
+            y_lags = y_series[t - lags:t]
+            x_lags = exo_series[t - lags:t]
             X_list.append(np.concatenate([y_lags, x_lags]))
             y_list.append(y_series[t])
     return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32)
@@ -269,15 +266,15 @@ def train_and_predict(
 
     # Armar resultados
     out_data = {
-    	"Producto": df_group[product_col].astype(str).values,
-    	"Provedores": df_group[provider_col].astype(str).values,
-    	"Pred_Sig_Semana": preds_round,
-	}
+        "Producto": df_group[product_col].astype(str).values,
+        "Provedores": df_group[provider_col].astype(str).values,
+        "Pred_Sig_Semana": preds_round,
+    }
 
-	if "Name" in df_group.columns:
-    	out_data["Name"] = df_group["Name"].astype(str).values
+    if "Name" in df_group.columns:
+        out_data["Name"] = df_group["Name"].astype(str).values
 
-	out = pd.DataFrame(out_data)
+    out = pd.DataFrame(out_data).sort_values("Pred_Sig_Semana", ascending=False).reset_index(drop=True)
     return out
 
 
@@ -343,10 +340,8 @@ def api_predict(
     results = train_and_predict(df, group=group, epochs=epochs)
     total = int(results["Pred_Sig_Semana"].sum())
 
-    # Top / todos
     out_df = results if top == 0 else results.head(top)
 
-    # Agrupado por proveedor (solo cuando group=ALL)
     if group.upper() == "ALL" and group_by_provider:
         sorted_df = results.sort_values(["Provedores", "Pred_Sig_Semana"], ascending=[True, False])
         grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -371,6 +366,7 @@ def api_predict(
         "total_pred_next_week": total,
     }
 
+
 @app.get("/db-test")
 def db_test():
     db = get_db()
@@ -381,6 +377,7 @@ def db_test():
         return {"ok": False, "error": str(e)}
     finally:
         db.close()
+
 
 @app.get("/db-pedido-info")
 def db_pedido_info(limit: int = 3):
@@ -400,6 +397,7 @@ def db_pedido_info(limit: int = 3):
     finally:
         db.close()
 
+
 @app.get("/predict-db")
 def api_predict_db(
     group: str = Query("ALL", description='Grupo a predecir. "ALL" para todos. Ej: SOR'),
@@ -407,16 +405,13 @@ def api_predict_db(
     top: int = Query(20, ge=0, le=50000, description="0 = todos; si no, Top N"),
     group_by_provider: bool = Query(False, description="Si true y group=ALL, agrupa por Provedores"),
 ):
-    # 1) Cargar tabla pedido -> DataFrame tipo CSV
     df = load_dataset_from_db("pedido")
 
-    # 2) Reusar tu pipeline actual (NARX)
     results = train_and_predict(df, group=group, epochs=epochs)
     total = int(results["Pred_Sig_Semana"].sum())
 
     out_df = results if top == 0 else results.head(top)
 
-    # 3) Si se pide agrupado por proveedor (solo en ALL)
     if group.upper() == "ALL" and group_by_provider:
         sorted_df = results.sort_values(["Provedores", "Pred_Sig_Semana"], ascending=[True, False])
         grouped = {str(k): v.to_dict(orient="records") for k, v in sorted_df.groupby("Provedores", sort=True)}
@@ -437,6 +432,7 @@ def api_predict_db(
         "results": out_df.to_dict(orient="records"),
         "total_pred_next_week": total,
     }
+
 
 @app.get("/db/providers")
 def db_providers():
