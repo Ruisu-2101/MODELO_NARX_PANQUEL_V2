@@ -34,8 +34,13 @@ if DATABASE_URL:
     )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+def get_db():
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL no configurada.")
+    return SessionLocal()
+
 def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
-    db = SessionLocal()
+    db = get_db()
     try:
         result = db.execute(text(f'SELECT * FROM "{table_name}"'))
         rows = result.fetchall()
@@ -354,7 +359,7 @@ def api_predict(
 
 @app.get("/db-test")
 def db_test():
-    db = SessionLocal()
+    db = get_db()
     try:
         row = db.execute(text("select now() as now;")).mappings().first()
         return {"ok": True, "now": str(row["now"])}
@@ -365,7 +370,7 @@ def db_test():
 
 @app.get("/db-pedido-info")
 def db_pedido_info(limit: int = 3):
-    db = SessionLocal()
+    db = get_db()
     try:
         result = db.execute(text("SELECT * FROM pedido LIMIT :n"), {"n": limit})
         rows = result.fetchall()
@@ -421,7 +426,7 @@ def api_predict_db(
 
 @app.get("/db/providers")
 def db_providers():
-    db = SessionLocal()
+    db = get_db()
     try:
         rows = db.execute(text("""
             select distinct proveedor_id
