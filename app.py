@@ -93,7 +93,7 @@ APP_DATA_DIR = os.getenv("APP_DATA_DIR", "/tmp/uploads")
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
 LAGS = 6
-DEFAULT_EPOCHS = int(os.getenv("EPOCHS", "100"))  # default bajo para Render
+DEFAULT_EPOCHS = int(os.getenv("EPOCHS", "400"))  # default bajo para Render
 LR = float(os.getenv("LR", "0.01"))
 TEST_SIZE = float(os.getenv("TEST_SIZE", "0.2"))
 SEED = int(os.getenv("SEED", "42"))
@@ -205,26 +205,16 @@ def train_and_predict(
     provider_col = pick_first_existing(df, FALLBACK_PROVIDER_COLS)
     week_cols = get_week_cols(df)
 
-    # Matriz numérica
+    # Matriz numérica completa
     weeks_df = df[week_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     data_all = weeks_df.values.astype(np.float32)
 
-    # Filtrar por grupo si aplica
-    if group.upper() == "ALL":
-        df_group = df.copy()
-        data_group = data_all
-    else:
-        mask = df[provider_col].apply(lambda x: group in split_groups(x))
-        df_group = df.loc[mask].copy()
-        data_group = data_all[mask.values]
-        if df_group.empty:
-            raise HTTPException(status_code=404, detail=f"No hay productos para el grupo: {group}")
-
-    # Exógena global (recomendado)
+    # =====================================================
+    # 1) ENTRENAMIENTO GLOBAL CON TODO EL DATASET
+    # =====================================================
     exo_total = data_all.sum(axis=0).astype(np.float32)
 
-    # Ventanas
-    X, y = make_windows_narx(data_group, exo_total, lags=LAGS)
+    X, y = make_windows_narx(data_all, exo_total, lags=LAGS)
     if len(X) < 10:
         raise HTTPException(status_code=400, detail="Dataset insuficiente para entrenar con LAGS=6.")
 
@@ -250,10 +240,27 @@ def train_and_predict(
         loss.backward()
         optimizer.step()
 
-    # Predicción próxima semana por producto
+    # =====================================================
+    # 2) FILTRADO SOLO PARA LA SALIDA/PREDICCIÓN
+    # =====================================================
+    if group.upper() == "ALL":
+        df_group = df.copy()
+        data_group = data_all
+    else:
+        mask = df[provider_col].apply(lambda x: group in split_groups(x))
+        df_group = df.loc[mask].copy()
+        data_group = data_all[mask.values]
+
+        if df_group.empty:
+            raise HTTPException(status_code=404, detail=f"No hay productos para el grupo: {group}")
+
+    # =====================================================
+    # 3) PREDICCIÓN DE LA SIGUIENTE SEMANA CON MODELO GLOBAL
+    # =====================================================
     model.eval()
-    last_x = exo_total[-LAGS:]
+    last_x = exo_total[-LAGS:]   # exógena global, igual que en tu primer código
     preds = []
+
     with torch.no_grad():
         for i in range(data_group.shape[0]):
             last_y = data_group[i, -LAGS:]
