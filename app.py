@@ -1,21 +1,23 @@
 import os
 import re
 import shutil
+import traceback
 from datetime import datetime
 from typing import List, Dict, Any
 
 import numpy as np
 import pandas as pd
 import torch
-import traceback
 from torch import nn
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import HTMLResponse
-
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+# =========================
+# CONFIG BD
+# =========================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     DATABASE_URL = None  # permite correr sin BD si no está seteada
@@ -39,6 +41,101 @@ def get_db():
     return SessionLocal()
 
 
+# =========================
+# CONFIG GENERAL
+# =========================
+APP_DATA_DIR = os.getenv("APP_DATA_DIR", "/tmp/uploads")
+os.makedirs(APP_DATA_DIR, exist_ok=True)
+
+LAGS = 6
+DEFAULT_EPOCHS = int(os.getenv("EPOCHS", "400"))
+LR = float(os.getenv("LR", "0.01"))
+TEST_SIZE = float(os.getenv("TEST_SIZE", "0.2"))
+SEED = int(os.getenv("SEED", "42"))
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# Columnas meta conocidas
+META_COLS = ["ID", "Producto", "Unidad", "Provedores", "Name"]
+
+# Fallbacks comunes
+FALLBACK_PRODUCT_COLS = ["Producto", "producto_nombre", "Unnamed: 0", "PRODUCTO", "product"]
+FALLBACK_PROVIDER_COLS = ["Provedores", "proveedor_id", "Proveedores", "Proveedor", "PROVEEDOR", "provider"]
+
+
+app = FastAPI(title="Panquel Predict API")
+
+
+# =========================
+# UTILIDADES DE COLUMNAS
+# =========================
+def is_week_column(col_name: str) -> bool:
+    """
+    Detecta columnas de semana como las de tu tabla:
+    03-Jan-25, 10-Jan-25, etc.
+    """
+    if not isinstance(col_name, str):
+        return False
+    col_name = col_name.strip()
+    return re.match(r"^\d{2}-[A-Za-z]{3}-\d{2}$", col_name) is not None
+
+
+def pick_first_existing(df: pd.DataFrame, candidates: List[str]) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise HTTPException(
+        status_code=400,
+        detail=f"No encontré ninguna columna válida entre: {candidates}"
+    )
+
+
+def split_groups(cell: Any) -> List[str]:
+    """Separa 'CON, SOR / ALA|X' -> ['CON','SOR','ALA','X']"""
+    if cell is None or (isinstance(cell, float) and np.isnan(cell)):
+        return []
+    s = str(cell).strip()
+    if not s:
+        return []
+    parts = re.split(r"[,\;/\|\+]+", s)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def get_week_cols(df: pd.DataFrame) -> List[str]:
+    """
+    Prioridad 1: detectar semanas por patrón fecha tipo 03-Jan-25
+    Prioridad 2: fallback por exclusión de columnas meta
+    """
+    week_cols = [c for c in df.columns if is_week_column(c)]
+
+    if week_cols:
+        try:
+            week_cols = sorted(
+                week_cols,
+                key=lambda x: datetime.strptime(x, "%d-%b-%y")
+            )
+        except Exception:
+            pass
+        return week_cols
+
+    known = set(META_COLS)
+    for c in FALLBACK_PRODUCT_COLS + FALLBACK_PROVIDER_COLS:
+        known.add(c)
+
+    known.update({"id", "cantidad", "name", "unidad", "created_at", "updated_at"})
+
+    week_cols = [c for c in df.columns if c not in known]
+
+    if not week_cols and len(df.columns) > 1:
+        week_cols = df.columns[1:].tolist()
+
+    return week_cols
+
+
+# =========================
+# CARGA DESDE BD
+# =========================
 def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
     db = get_db()
     try:
@@ -47,7 +144,9 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
         cols = list(result.keys())
         df = pd.DataFrame(rows, columns=cols)
 
-        # Detectar columnas meta
+        if df.empty:
+            raise HTTPException(status_code=400, detail=f'La tabla "{table_name}" no tiene datos.')
+
         col_producto = "producto_nombre" if "producto_nombre" in df.columns else None
         col_prov = "proveedor_id" if "proveedor_id" in df.columns else None
         col_name = "name" if "name" in df.columns else None
@@ -58,18 +157,18 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
                 detail=f"No encontré columnas producto/proveedor. Columnas: {df.columns.tolist()}"
             )
 
-        # Columnas a excluir (no son semanas)
-        exclude = {"id", "cantidad", col_producto, col_prov, col_name}
+        week_cols = get_week_cols(df)
 
-        # Semanas = todo lo demás
-        week_cols = [c for c in df.columns if c not in exclude]
+        if not week_cols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No encontré columnas de semanas. Columnas detectadas: {df.columns.tolist()}"
+            )
 
-        # Convertir semanas a numérico
         df[week_cols] = df[week_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
-        # Orden final y nombres estándar (para reutilizar tu pipeline)
-        cols = [col_producto, col_prov] + ([col_name] if col_name else []) + week_cols
-        df = df[cols].copy()
+        cols_final = [col_producto, col_prov] + ([col_name] if col_name else []) + week_cols
+        df = df[cols_final].copy()
 
         rename_map = {
             col_producto: "Producto",
@@ -87,73 +186,14 @@ def load_dataset_from_db(table_name: str = "pedido") -> pd.DataFrame:
 
 
 # =========================
-# CONFIG GENERAL
-# =========================
-APP_DATA_DIR = os.getenv("APP_DATA_DIR", "/tmp/uploads")
-os.makedirs(APP_DATA_DIR, exist_ok=True)
-
-LAGS = 6
-DEFAULT_EPOCHS = int(os.getenv("EPOCHS", "400"))  # default bajo para Render
-LR = float(os.getenv("LR", "0.01"))
-TEST_SIZE = float(os.getenv("TEST_SIZE", "0.2"))
-SEED = int(os.getenv("SEED", "42"))
-
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-# Columnas esperadas en dataset "mejorado"
-META_COLS = ["ID", "Producto", "Unidad", "Provedores", "Name"]
-
-# Fallbacks comunes
-FALLBACK_PRODUCT_COLS = ["Producto", "Unnamed: 0", "PRODUCTO", "product"]
-FALLBACK_PROVIDER_COLS = ["Provedores", "Proveedores", "Proveedor", "PROVEEDOR", "provider"]
-
-app = FastAPI(title="Panquel Predict API")
-
-
-# =========================
 # UTILIDADES DE ARCHIVOS
 # =========================
 def latest_uploaded_file() -> str:
     files = [f for f in os.listdir(APP_DATA_DIR) if f.lower().endswith(".csv")]
     if not files:
         raise HTTPException(status_code=404, detail="No hay CSV subido. Usa /upload.")
-    files.sort()  # timestamp al inicio => orden correcto
+    files.sort()
     return os.path.join(APP_DATA_DIR, files[-1])
-
-
-# =========================
-# UTILIDADES DE DATASET
-# =========================
-def pick_first_existing(df: pd.DataFrame, candidates: List[str]) -> str:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    raise HTTPException(status_code=400, detail=f"No encontré ninguna columna válida entre: {candidates}")
-
-
-def split_groups(cell: Any) -> List[str]:
-    """Separa 'CON, SOR / ALA|X' -> ['CON','SOR','ALA','X']"""
-    if cell is None or (isinstance(cell, float) and np.isnan(cell)):
-        return []
-    s = str(cell).strip()
-    if not s:
-        return []
-    parts = re.split(r"[,\;/\|\+]+", s)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def get_week_cols(df: pd.DataFrame) -> List[str]:
-    """Columnas numéricas de semanas: todo lo que NO sea meta conocida."""
-    known = set(META_COLS)
-    for c in FALLBACK_PRODUCT_COLS + FALLBACK_PROVIDER_COLS:
-        known.add(c)
-    week_cols = [c for c in df.columns if c not in known]
-
-    if not week_cols:
-        if len(df.columns) > 1:
-            week_cols = df.columns[1:].tolist()
-    return week_cols
 
 
 def list_groups(df: pd.DataFrame, provider_col: str) -> List[str]:
@@ -170,6 +210,7 @@ def list_groups(df: pd.DataFrame, provider_col: str) -> List[str]:
 def make_windows_narx(data_matrix: np.ndarray, exo_series: np.ndarray, lags: int = 6):
     X_list, y_list = [], []
     n_products, n_weeks = data_matrix.shape
+
     for p in range(n_products):
         y_series = data_matrix[p]
         for t in range(lags, n_weeks):
@@ -177,6 +218,7 @@ def make_windows_narx(data_matrix: np.ndarray, exo_series: np.ndarray, lags: int
             x_lags = exo_series[t - lags:t]
             X_list.append(np.concatenate([y_lags, x_lags]))
             y_list.append(y_series[t])
+
     return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32)
 
 
@@ -209,16 +251,20 @@ def train_and_predict(
     weeks_df = df[week_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     data_all = weeks_df.values.astype(np.float32)
 
-    # =====================================================
-    # 1) ENTRENAMIENTO GLOBAL CON TODO EL DATASET
-    # =====================================================
+    if data_all.shape[1] <= LAGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No hay suficientes semanas para LAGS={LAGS}. Semanas detectadas: {len(week_cols)}"
+        )
+
+    # Exógena global
     exo_total = data_all.sum(axis=0).astype(np.float32)
 
+    # ENTRENAR CON TODO EL DATASET
     X, y = make_windows_narx(data_all, exo_total, lags=LAGS)
     if len(X) < 10:
         raise HTTPException(status_code=400, detail="Dataset insuficiente para entrenar con LAGS=6.")
 
-    # Split temporal
     split_idx = int(len(X) * (1 - TEST_SIZE))
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
@@ -226,12 +272,10 @@ def train_and_predict(
     X_train_t = torch.tensor(X_train)
     y_train_t = torch.tensor(y_train).unsqueeze(1)
 
-    # Modelo
     model = NeuralNARX(input_size=2 * LAGS)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = nn.MSELoss()
 
-    # Entrenamiento
     model.train()
     for _ in range(epochs):
         optimizer.zero_grad()
@@ -240,9 +284,7 @@ def train_and_predict(
         loss.backward()
         optimizer.step()
 
-    # =====================================================
-    # 2) FILTRADO SOLO PARA LA SALIDA/PREDICCIÓN
-    # =====================================================
+    # FILTRAR SOLO AL FINAL
     if group.upper() == "ALL":
         df_group = df.copy()
         data_group = data_all
@@ -254,11 +296,9 @@ def train_and_predict(
         if df_group.empty:
             raise HTTPException(status_code=404, detail=f"No hay productos para el grupo: {group}")
 
-    # =====================================================
-    # 3) PREDICCIÓN DE LA SIGUIENTE SEMANA CON MODELO GLOBAL
-    # =====================================================
+    # Predicción próxima semana
     model.eval()
-    last_x = exo_total[-LAGS:]   # exógena global, igual que en tu primer código
+    last_x = exo_total[-LAGS:]
     preds = []
 
     with torch.no_grad():
@@ -271,7 +311,6 @@ def train_and_predict(
     preds = np.array(preds)
     preds_round = np.clip(np.rint(preds), 0, None).astype(int)
 
-    # Armar resultados
     out_data = {
         "Producto": df_group[product_col].astype(str).values,
         "Provedores": df_group[provider_col].astype(str).values,
@@ -297,7 +336,12 @@ def home():
       <button type="submit">Subir</button>
     </form>
     <p>Archivos: <a href="/files">/files</a></p>
-    <p>Grupos: <a href="/groups">/groups</a></p>
+    <p>Grupos CSV: <a href="/groups">/groups</a></p>
+    <p>Predicción CSV: <a href="/predict">/predict</a></p>
+    <p>Prueba BD: <a href="/db-test">/db-test</a></p>
+    <p>Info pedido: <a href="/db-pedido-info">/db-pedido-info</a></p>
+    <p>Proveedores BD: <a href="/db/providers">/db/providers</a></p>
+    <p>Predicción BD: <a href="/predict-db">/predict-db</a></p>
     <p>Docs: <a href="/docs">/docs</a></p>
     """
 
@@ -320,7 +364,11 @@ async def upload_file(file: UploadFile = File(...)):
 @app.get("/files")
 def list_files():
     files = sorted([f for f in os.listdir(APP_DATA_DIR) if f.lower().endswith(".csv")])
-    return {"path": APP_DATA_DIR, "files": files, "latest": os.path.basename(latest_uploaded_file()) if files else None}
+    return {
+        "path": APP_DATA_DIR,
+        "files": files,
+        "latest": os.path.basename(latest_uploaded_file()) if files else None
+    }
 
 
 @app.get("/groups")
@@ -331,13 +379,17 @@ def api_groups():
     provider_col = pick_first_existing(df, FALLBACK_PROVIDER_COLS)
     groups = list_groups(df, provider_col)
 
-    return {"latest_file": os.path.basename(path), "provider_col": provider_col, "groups": groups}
+    return {
+        "latest_file": os.path.basename(path),
+        "provider_col": provider_col,
+        "groups": groups
+    }
 
 
 @app.get("/predict")
 def api_predict(
     group: str = Query("ALL", description='Grupo a predecir. "ALL" para todos. Ej: SOR'),
-    epochs: int = Query(DEFAULT_EPOCHS, ge=5, le=600, description="Épocas (más = más lento)"),
+    epochs: int = Query(DEFAULT_EPOCHS, ge=5, le=1000, description="Épocas (más = más lento)"),
     top: int = Query(20, ge=0, le=50000, description="0 = todos; si no, Top N"),
     group_by_provider: bool = Query(False, description="Si true y group=ALL, agrupa por Provedores"),
 ):
@@ -360,6 +412,7 @@ def api_predict(
             "group": group,
             "epochs": epochs,
             "lags": LAGS,
+            "week_cols": get_week_cols(df),
             "grouped_by_provider": grouped,
             "total_pred_next_week": total,
         }
@@ -369,6 +422,7 @@ def api_predict(
         "group": group,
         "epochs": epochs,
         "lags": LAGS,
+        "week_cols": get_week_cols(df),
         "results": out_df.to_dict(orient="records"),
         "total_pred_next_week": total,
     }
@@ -396,9 +450,19 @@ def db_pedido_info(limit: int = 3):
 
         preview = []
         for r in rows:
-            preview.append({cols[i]: (str(r[i]) if r[i] is not None else None) for i in range(len(cols))})
+            preview.append({
+                cols[i]: (str(r[i]) if r[i] is not None else None)
+                for i in range(len(cols))
+            })
 
-        return {"ok": True, "columns": cols, "preview": preview}
+        df_full = load_dataset_from_db("pedido")
+
+        return {
+            "ok": True,
+            "columns": cols,
+            "week_cols_detected": get_week_cols(df_full),
+            "preview": preview
+        }
     except Exception:
         return {"ok": False, "error": traceback.format_exc()}
     finally:
@@ -408,7 +472,7 @@ def db_pedido_info(limit: int = 3):
 @app.get("/predict-db")
 def api_predict_db(
     group: str = Query("ALL", description='Grupo a predecir. "ALL" para todos. Ej: SOR'),
-    epochs: int = Query(DEFAULT_EPOCHS, ge=5, le=600, description="Épocas (más = más lento)"),
+    epochs: int = Query(DEFAULT_EPOCHS, ge=5, le=1000, description="Épocas (más = más lento)"),
     top: int = Query(20, ge=0, le=50000, description="0 = todos; si no, Top N"),
     group_by_provider: bool = Query(False, description="Si true y group=ALL, agrupa por Provedores"),
 ):
@@ -416,17 +480,20 @@ def api_predict_db(
 
     results = train_and_predict(df, group=group, epochs=epochs)
     total = int(results["Pred_Sig_Semana"].sum())
-
     out_df = results if top == 0 else results.head(top)
 
     if group.upper() == "ALL" and group_by_provider:
         sorted_df = results.sort_values(["Provedores", "Pred_Sig_Semana"], ascending=[True, False])
-        grouped = {str(k): v.to_dict(orient="records") for k, v in sorted_df.groupby("Provedores", sort=True)}
+        grouped = {
+            str(k): v.to_dict(orient="records")
+            for k, v in sorted_df.groupby("Provedores", sort=True)
+        }
         return {
             "source": "supabase_table:pedido",
             "group": group,
             "epochs": epochs,
             "lags": LAGS,
+            "week_cols": get_week_cols(df),
             "grouped_by_provider": grouped,
             "total_pred_next_week": total,
         }
@@ -436,6 +503,7 @@ def api_predict_db(
         "group": group,
         "epochs": epochs,
         "lags": LAGS,
+        "week_cols": get_week_cols(df),
         "results": out_df.to_dict(orient="records"),
         "total_pred_next_week": total,
     }
